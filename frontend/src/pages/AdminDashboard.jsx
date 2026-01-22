@@ -39,7 +39,7 @@ const fetchData = useCallback(async () => {
   } finally {
     setLoading(false);
   }
-}, [API, navigate]);
+}, [navigate]);
 
 useEffect(() => {
   const token = localStorage.getItem("admin_token");
