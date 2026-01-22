@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
@@ -14,43 +14,43 @@ export default function AdminDashboard() {
   const [registrations, setRegistrations] = useState([]);
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
-  
-  useEffect(() => {
-    const token = localStorage.getItem('admin_token');
-    if (!token) {
-      toast.error('Please login to access dashboard');
-      navigate('/admin');
-      return;
+
+const fetchData = useCallback(async () => {
+  const token = localStorage.getItem("admin_token");
+  const headers = { Authorization: `Bearer ${token}` };
+
+  try {
+    const [regsResponse, statsResponse] = await Promise.all([
+      axios.get(`${API}/registrations`, { headers }),
+      axios.get(`${API}/registrations/stats`, { headers }),
+    ]);
+
+    setRegistrations(regsResponse.data);
+    setStats(statsResponse.data);
+  } catch (error) {
+    if (error.response?.status === 401) {
+      toast.error("Session expired. Please login again.");
+      localStorage.removeItem("admin_token");
+      navigate("/admin");
+    } else {
+      toast.error("Failed to fetch data");
     }
-    
-    fetchData();
-  }, [navigate]);
-  
-  const fetchData = async () => {
-    const token = localStorage.getItem('admin_token');
-    const headers = { Authorization: `Bearer ${token}` };
-    
-    try {
-      const [regsResponse, statsResponse] = await Promise.all([
-        axios.get(`${API}/registrations`, { headers }),
-        axios.get(`${API}/registrations/stats`, { headers })
-      ]);
-      
-      setRegistrations(regsResponse.data);
-      setStats(statsResponse.data);
-    } catch (error) {
-      if (error.response?.status === 401) {
-        toast.error('Session expired. Please login again.');
-        localStorage.removeItem('admin_token');
-        navigate('/admin');
-      } else {
-        toast.error('Failed to fetch data');
-      }
-      console.error('Fetch error:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+    console.error("Fetch error:", error);
+  } finally {
+    setLoading(false);
+  }
+}, [API, navigate]);
+
+useEffect(() => {
+  const token = localStorage.getItem("admin_token");
+  if (!token) {
+    toast.error("Please login to access dashboard");
+    navigate("/admin");
+    return;
+  }
+
+  fetchData();
+}, [fetchData, navigate]);
   
   const handleExport = async () => {
     const token = localStorage.getItem('admin_token');
