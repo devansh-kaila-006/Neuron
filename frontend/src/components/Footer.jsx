@@ -24,6 +24,9 @@ export const Footer = () => {
               <Link to="/about" className="block text-sm text-muted-foreground hover:text-primary transition-colors" data-testid="footer-link-about">
                 About Us
               </Link>
+              <Link to="/team" className="block text-sm text-muted-foreground hover:text-primary transition-colors" data-testid="footer-link-team">
+                Our Team
+              </Link>
               <Link to="/hackathon" className="block text-sm text-muted-foreground hover:text-primary transition-colors" data-testid="footer-link-hackathon">
                 Hackathon
               </Link>
