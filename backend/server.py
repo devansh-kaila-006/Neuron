@@ -1,11 +1,9 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header
 from fastapi.responses import StreamingResponse
-from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
-from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional
 import uuid
@@ -16,32 +14,65 @@ import jwt
 import csv
 import io
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+# -------------------------------------------------------------------
+# ENVIRONMENT VALIDATION
+# -------------------------------------------------------------------
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("DB_NAME", "neuron_db")
+SECRET_KEY = os.getenv("SECRET_KEY")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+CORS_ORIGINS = os.getenv("CORS_ORIGINS")
 
-# JWT Configuration
-SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'neuron-secret-key-2025-ai-ml-dl')
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+
+missing = [
+    k for k, v in {
+        "MONGO_URI": MONGO_URI,
+        "SECRET_KEY": SECRET_KEY,
+        "ADMIN_PASSWORD": ADMIN_PASSWORD,
+        "CORS_ORIGINS": CORS_ORIGINS,
+        "RAZORPAY_KEY_ID": RAZORPAY_KEY_ID,
+        "RAZORPAY_KEY_SECRET": RAZORPAY_KEY_SECRET,
+    }.items() if not v
+]
+
+if missing:
+    raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
+
+# -------------------------------------------------------------------
+# DATABASE
+# -------------------------------------------------------------------
+
+client = AsyncIOMotorClient(MONGO_URI)
+db = client[DB_NAME]
+
+# -------------------------------------------------------------------
+# JWT CONFIG
+# -------------------------------------------------------------------
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
-# Razorpay Configuration
-RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', 'rzp_test_dummy')
-RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET', 'dummy_secret')
-razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+# -------------------------------------------------------------------
+# RAZORPAY
+# -------------------------------------------------------------------
 
-# Create the main app
+razorpay_client = razorpay.Client(
+    auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
+)
+
+# -------------------------------------------------------------------
+# APP SETUP
+# -------------------------------------------------------------------
+
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# Models
-class AdminCreate(BaseModel):
-    username: str
-    password: str
+# -------------------------------------------------------------------
+# MODELS
+# -------------------------------------------------------------------
 
 class AdminLogin(BaseModel):
     username: str
@@ -60,7 +91,7 @@ class RegistrationCreate(BaseModel):
     phone: str
     college: str
     team_name: Optional[str] = None
-    honeypot: Optional[str] = None  # Hidden field for bot detection
+    honeypot: Optional[str] = None
 
 class Registration(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -78,7 +109,7 @@ class Registration(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class PaymentOrderCreate(BaseModel):
-    amount: int  # Amount in paise (INR)
+    amount: int
     registration_id: str
     full_name: str
     email: str
@@ -90,259 +121,140 @@ class PaymentVerify(BaseModel):
     razorpay_signature: str
     registration_id: str
 
-# Helper Functions
+# -------------------------------------------------------------------
+# AUTH HELPERS
+# -------------------------------------------------------------------
+
 def create_access_token(data: dict):
-    to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    payload = data.copy()
+    payload["exp"] = datetime.now(timezone.utc) + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 def verify_token(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
-    
+
     token = authorization.split(" ")[1]
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return username
+        return payload.get("sub")
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
+    except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# Admin Routes
+# -------------------------------------------------------------------
+# ADMIN ROUTES
+# -------------------------------------------------------------------
+
 @api_router.post("/auth/admin-login")
 async def admin_login(credentials: AdminLogin):
-    admin = await db.admins.find_one({"username": credentials.username}, {"_id": 0})
-    
+    admin = await db.admins.find_one({"username": credentials.username})
     if not admin:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    if not bcrypt.checkpw(credentials.password.encode('utf-8'), admin['hashed_password'].encode('utf-8')):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    access_token = create_access_token(data={"sub": credentials.username})
-    return {"access_token": access_token, "token_type": "bearer"}
 
-# Registration Routes
+    if not bcrypt.checkpw(
+        credentials.password.encode(),
+        admin["hashed_password"].encode()
+    ):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_access_token({"sub": credentials.username})
+    return {"access_token": token, "token_type": "bearer"}
+
+# -------------------------------------------------------------------
+# REGISTRATION ROUTES
+# -------------------------------------------------------------------
+
 @api_router.post("/registrations", response_model=Registration)
 async def create_registration(reg: RegistrationCreate):
-    # Honeypot check - if filled, it's a bot
     if reg.honeypot:
         raise HTTPException(status_code=400, detail="Invalid submission")
-    
-    # Check for duplicate email
-    existing = await db.registrations.find_one({"email": reg.email}, {"_id": 0})
-    if existing:
+
+    if await db.registrations.find_one({"email": reg.email}):
         raise HTTPException(status_code=400, detail="Email already registered")
-    
-    # Generate unique registration ID
-    registration_id = f"NEU{datetime.now().strftime('%Y%m%d')}{str(uuid.uuid4())[:8].upper()}"
-    
-    registration_obj = Registration(
+
+    registration_id = f"NEU{datetime.now().strftime('%Y%m%d')}{uuid.uuid4().hex[:8].upper()}"
+
+    registration = Registration(
         registration_id=registration_id,
         full_name=reg.full_name,
         email=reg.email,
         phone=reg.phone,
         college=reg.college,
-        team_name=reg.team_name,
-        payment_status="pending"
+        team_name=reg.team_name
     )
-    
-    doc = registration_obj.model_dump()
-    doc['created_at'] = doc['created_at'].isoformat()
-    
-    await db.registrations.insert_one(doc)
-    return registration_obj
+
+    await db.registrations.insert_one(registration.model_dump())
+    return registration
 
 @api_router.get("/registrations", response_model=List[Registration])
-async def get_registrations(username: str = Depends(verify_token)):
-    registrations = await db.registrations.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
-    
-    for reg in registrations:
-        if isinstance(reg.get('created_at'), str):
-            reg['created_at'] = datetime.fromisoformat(reg['created_at'])
-    
-    return registrations
+async def get_registrations(_: str = Depends(verify_token)):
+    return await db.registrations.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
 
-@api_router.get("/registrations/export")
-async def export_registrations(username: str = Depends(verify_token)):
-    registrations = await db.registrations.find({}, {"_id": 0}).sort("created_at", -1).to_list(10000)
-    
-    # Create CSV
-    output = io.StringIO()
-    writer = csv.writer(output)
-    
-    # Write header
-    writer.writerow([
-        'Registration ID', 'Full Name', 'Email', 'Phone', 
-        'College', 'Team Name', 'Payment Status', 'Transaction ID', 
-        'Amount (INR)', 'Created At'
-    ])
-    
-    # Write data
-    for reg in registrations:
-        writer.writerow([
-            reg.get('registration_id', ''),
-            reg.get('full_name', ''),
-            reg.get('email', ''),
-            reg.get('phone', ''),
-            reg.get('college', ''),
-            reg.get('team_name', ''),
-            reg.get('payment_status', ''),
-            reg.get('transaction_id', ''),
-            reg.get('amount', 0) / 100 if reg.get('amount') else 0,
-            reg.get('created_at', '')
-        ])
-    
-    output.seek(0)
-    
-    return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=neuron_registrations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"}
+# -------------------------------------------------------------------
+# PAYMENTS
+# -------------------------------------------------------------------
+
+@api_router.post("/payment/create-order")
+async def create_payment_order(data: PaymentOrderCreate):
+    registration = await db.registrations.find_one(
+        {"registration_id": data.registration_id}
     )
 
-@api_router.get("/registrations/stats")
-async def get_stats(username: str = Depends(verify_token)):
-    total = await db.registrations.count_documents({})
-    paid = await db.registrations.count_documents({"payment_status": "completed"})
-    pending = await db.registrations.count_documents({"payment_status": "pending"})
-    
-    # Calculate total revenue
-    paid_registrations = await db.registrations.find(
-        {"payment_status": "completed"},
-        {"_id": 0, "amount": 1}
-    ).to_list(10000)
-    
-    total_revenue = sum(reg.get('amount', 0) for reg in paid_registrations)
-    
+    if not registration:
+        raise HTTPException(status_code=404, detail="Registration not found")
+
+    order = razorpay_client.order.create({
+        "amount": data.amount,
+        "currency": "INR",
+        "payment_capture": 1
+    })
+
+    await db.registrations.update_one(
+        {"registration_id": data.registration_id},
+        {"$set": {"order_id": order["id"], "amount": data.amount}}
+    )
+
     return {
-        "total_registrations": total,
-        "paid_registrations": paid,
-        "pending_registrations": pending,
-        "total_revenue_inr": total_revenue / 100
+        "order_id": order["id"],
+        "amount": order["amount"],
+        "key_id": RAZORPAY_KEY_ID
     }
 
-# Payment Routes
-@api_router.post("/payment/create-order")
-async def create_payment_order(order_data: PaymentOrderCreate):
-    try:
-        # Check if registration exists
-        registration = await db.registrations.find_one(
-            {"registration_id": order_data.registration_id},
-            {"_id": 0}
-        )
-        
-        if not registration:
-            raise HTTPException(status_code=404, detail="Registration not found")
-        
-        if registration.get('payment_status') == 'completed':
-            raise HTTPException(status_code=400, detail="Payment already completed")
-        
-        # Create Razorpay order
-        razorpay_order = razorpay_client.order.create({
-            "amount": order_data.amount,
-            "currency": "INR",
-            "payment_capture": 1,
-            "notes": {
-                "registration_id": order_data.registration_id,
-                "email": order_data.email,
-                "name": order_data.full_name
-            }
-        })
-        
-        # Update registration with order details
-        await db.registrations.update_one(
-            {"registration_id": order_data.registration_id},
-            {"$set": {
-                "order_id": razorpay_order['id'],
-                "amount": order_data.amount
-            }}
-        )
-        
-        return {
-            "order_id": razorpay_order['id'],
-            "amount": razorpay_order['amount'],
-            "currency": razorpay_order['currency'],
-            "key_id": RAZORPAY_KEY_ID
-        }
-    
-    except razorpay.errors.BadRequestError as e:
-        raise HTTPException(status_code=400, detail=f"Payment error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+# -------------------------------------------------------------------
+# APP CONFIG
+# -------------------------------------------------------------------
 
-@api_router.post("/payment/verify")
-async def verify_payment(payment_data: PaymentVerify):
-    try:
-        # Verify signature
-        params_dict = {
-            'razorpay_order_id': payment_data.razorpay_order_id,
-            'razorpay_payment_id': payment_data.razorpay_payment_id,
-            'razorpay_signature': payment_data.razorpay_signature
-        }
-        
-        razorpay_client.utility.verify_payment_signature(params_dict)
-        
-        # Update registration
-        await db.registrations.update_one(
-            {"registration_id": payment_data.registration_id},
-            {"$set": {
-                "payment_status": "completed",
-                "transaction_id": payment_data.razorpay_payment_id,
-                "order_id": payment_data.razorpay_order_id
-            }}
-        )
-        
-        return {"status": "success", "message": "Payment verified successfully"}
-    
-    except razorpay.errors.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid payment signature")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Verification error: {str(e)}")
-
-# Health Check
-@api_router.get("/")
-async def root():
-    return {"message": "Neuron Club API - Active"}
-
-# Include router
 app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=CORS_ORIGINS.split(","),
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# -------------------------------------------------------------------
+# STARTUP
+# -------------------------------------------------------------------
 
 @app.on_event("startup")
-async def startup_event():
-    # Create default admin if not exists
-    admin_exists = await db.admins.find_one({"username": "admin"})
-    if not admin_exists:
-        hashed_password = bcrypt.hashpw("NeuronAdmin@2025".encode('utf-8'), bcrypt.gensalt())
-        admin = Admin(
+async def startup():
+    if not await db.admins.find_one({"username": "admin"}):
+        hashed = bcrypt.hashpw(
+            ADMIN_PASSWORD.encode(),
+            bcrypt.gensalt()
+        ).decode()
+
+        await db.admins.insert_one(Admin(
             username="admin",
-            hashed_password=hashed_password.decode('utf-8')
-        )
-        doc = admin.model_dump()
-        doc['created_at'] = doc['created_at'].isoformat()
-        await db.admins.insert_one(doc)
-        logger.info("Default admin created: username='admin', password='NeuronAdmin@2025'")
+            hashed_password=hashed
+        ).model_dump())
 
 @app.on_event("shutdown")
-async def shutdown_db_client():
+async def shutdown():
     client.close()
