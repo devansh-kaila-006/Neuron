@@ -228,7 +228,7 @@ async def create_payment_order(data: PaymentOrderCreate):
 # APP CONFIG
 # -------------------------------------------------------------------
 
-app.include_router(api_router)
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "")
 
 app.add_middleware(
     CORSMiddleware,
