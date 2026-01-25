@@ -232,9 +232,9 @@ app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS.split(","),
+    allow_origins=[origin.strip() for origin in CORS_ORIGINS.split(",") if origin.strip()],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
